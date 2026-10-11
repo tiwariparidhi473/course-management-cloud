@@ -87,7 +87,7 @@
                     <i class="fas fa-download" style="margin-right:4px"></i>{{ m.download_count }} downloads
                 </div>
                 {% if m.file_path %}
-                <a href="#" class="btn btn-success btn-sm w-full" style="justify-content:center">
+                <a href="/materials/{{ m.id }}/download" class="btn btn-success btn-sm w-full" style="justify-content:center">
                     <i class="fas fa-download"></i> Download
                 </a>
                 {% endif %}

@@ -6,10 +6,24 @@ from werkzeug.utils import secure_filename
 from datetime import datetime, date
 import os
 import json
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Settings come from environment variables (.env file locally, Render dashboard in the cloud)
+DATABASE_URL = os.environ.get('DATABASE_URL', 'sqlite:///cms.db')
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+SUPABASE_URL = os.environ.get('SUPABASE_URL', '').rstrip('/')
+SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY', '')
+SUPABASE_BUCKET = os.environ.get('SUPABASE_BUCKET', 'uploads')
+USE_SUPABASE_STORAGE = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
 app = Flask(__name__)
-app.config['SECRET_KEY'] = 'cms-secret-key-2024-madurai-college'
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///cms.db'
+app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-only-change-me')
+app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {'pool_pre_ping': True}
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 app.config['UPLOAD_FOLDER'] = 'uploads'
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
@@ -28,6 +42,29 @@ ALLOWED_EXTENSIONS = {'pdf', 'doc', 'docx', 'ppt', 'pptx', 'mp4', 'png', 'jpg', 
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def save_upload(f, folder, filename):
+    """Save an uploaded file to the private Supabase Storage bucket (or local uploads/ if not configured)."""
+    if USE_SUPABASE_STORAGE:
+        resp = requests.post(
+            f'{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{folder}/{filename}',
+            headers={'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}', 'apikey': SUPABASE_SERVICE_KEY,
+                     'Content-Type': f.mimetype or 'application/octet-stream', 'x-upsert': 'true'},
+            data=f.read(), timeout=60)
+        resp.raise_for_status()
+    else:
+        f.save(os.path.join('uploads', folder, filename))
+
+def file_download_response(folder, filename):
+    """Private bucket: give the browser a signed link that expires after 5 minutes."""
+    if USE_SUPABASE_STORAGE:
+        resp = requests.post(
+            f'{SUPABASE_URL}/storage/v1/object/sign/{SUPABASE_BUCKET}/{folder}/{filename}',
+            headers={'Authorization': f'Bearer {SUPABASE_SERVICE_KEY}', 'apikey': SUPABASE_SERVICE_KEY},
+            json={'expiresIn': 300}, timeout=30)
+        resp.raise_for_status()
+        return redirect(f"{SUPABASE_URL}/storage/v1{resp.json()['signedURL']}")
+    return send_from_directory(os.path.join(app.root_path, 'uploads', folder), filename, as_attachment=True)
 
 # ============================================================
 # MODELS
@@ -502,7 +539,7 @@ def faculty_add_assignment():
         f = request.files['file']
         if allowed_file(f.filename):
             filename = secure_filename(f.filename)
-            f.save(os.path.join('uploads/assignments', filename))
+            save_upload(f, 'assignments', filename)
             file_path = filename
 
     due_date = None
@@ -535,7 +572,7 @@ def faculty_add_material():
         f = request.files['file']
         if allowed_file(f.filename):
             filename = secure_filename(f.filename)
-            f.save(os.path.join('uploads/materials', filename))
+            save_upload(f, 'materials', filename)
             file_path = filename
             ext = filename.rsplit('.', 1)[1].lower()
             if ext in ['mp4', 'avi', 'mkv']: file_type = 'video'
@@ -745,7 +782,7 @@ def student_submit_assignment(assignment_id):
         f = request.files['file']
         if allowed_file(f.filename):
             filename = f'{current_user.id}_{assignment_id}_{secure_filename(f.filename)}'
-            f.save(os.path.join('uploads/submissions', filename))
+            save_upload(f, 'submissions', filename)
             file_path = filename
 
     is_late = False
@@ -776,6 +813,20 @@ def student_results():
         .filter(Result.student_id == current_user.id, Result.published == True)\
         .order_by(Result.created_at.desc()).all()
     return render_template('student/results.html', results=results)
+
+@app.route('/materials/<int:material_id>/download')
+@login_required
+def download_material(material_id):
+    material = Material.query.get_or_404(material_id)
+    course = Course.query.get_or_404(material.course_id)
+    allowed = current_user.role == 'admin' or course.faculty_id == current_user.id or \
+        Enrollment.query.filter_by(student_id=current_user.id, course_id=course.id, status='approved').first()
+    if not allowed or not material.file_path:
+        flash('You do not have access to this file.', 'danger')
+        return redirect(url_for('index'))
+    material.download_count = (material.download_count or 0) + 1
+    db.session.commit()
+    return file_download_response('materials', material.file_path)
 
 @app.route('/profile', methods=['GET', 'POST'])
 @login_required
@@ -812,6 +863,9 @@ def seed_database():
     if User.query.count() > 0:
         return
 
+    from datetime import timedelta
+    now = datetime.utcnow().replace(second=0, microsecond=0)
+
     # Create admin
     admin = User(name='Admin User', email='admin@cms.edu',
                  password=generate_password_hash('admin123'),
@@ -822,17 +876,14 @@ def seed_database():
     faculty1 = User(name='Dr. Rajesh Kumar', email='faculty@cms.edu',
                     password=generate_password_hash('faculty123'),
                     role='faculty', department='Computer Science', phone='9876543211')
-    faculty2 = User(name='Prof. Priya Sharma', email='priya@cms.edu',
-                    password=generate_password_hash('faculty123'),
-                    role='faculty', department='Mathematics', phone='9876543212')
-    db.session.add_all([faculty1, faculty2])
+    db.session.add(faculty1)
 
     # Create students
     students = [
         User(name='Arun Krishnan', email='student@cms.edu', password=generate_password_hash('student123'),
              role='student', department='Computer Science', phone='9876543213'),
         User(name='Kavitha Rajan', email='kavitha@cms.edu', password=generate_password_hash('student123'),
-             role='student', department='Mathematics', phone='9876543214'),
+             role='student', department='Computer Science', phone='9876543214'),
         User(name='Vignesh Murugan', email='vignesh@cms.edu', password=generate_password_hash('student123'),
              role='student', department='Computer Science', phone='9876543215'),
     ]
@@ -847,12 +898,9 @@ def seed_database():
         Course(name='Database Management Systems', code='CS301', credits=3,
                semester=5, department='Computer Science', faculty_id=faculty1.id,
                description='Relational databases, SQL, and database design principles.', max_students=55),
-        Course(name='Calculus & Linear Algebra', code='MA101', credits=4,
-               semester=1, department='Mathematics', faculty_id=faculty2.id,
-               description='Foundation mathematics for engineering students.', max_students=70),
-        Course(name='Machine Learning Fundamentals', code='CS401', credits=3,
+        Course(name='Cloud Computing', code='CS402', credits=3,
                semester=7, department='Computer Science', faculty_id=faculty1.id,
-               description='Introduction to ML algorithms and applications.', max_students=45),
+               description='IaaS, PaaS, SaaS, virtualization and cloud deployment.', max_students=45),
         Course(name='Web Technologies', code='CS302', credits=3,
                semester=5, department='Computer Science', faculty_id=faculty1.id,
                description='HTML, CSS, JavaScript, and modern web frameworks.', max_students=50),
@@ -862,12 +910,13 @@ def seed_database():
 
     # Create enrollments
     enrollments = [
-        Enrollment(student_id=students[0].id, course_id=courses[0].id, status='approved', approved_at=datetime.utcnow()),
-        Enrollment(student_id=students[0].id, course_id=courses[1].id, status='approved', approved_at=datetime.utcnow()),
-        Enrollment(student_id=students[0].id, course_id=courses[4].id, status='pending'),
-        Enrollment(student_id=students[1].id, course_id=courses[2].id, status='approved', approved_at=datetime.utcnow()),
-        Enrollment(student_id=students[2].id, course_id=courses[0].id, status='approved', approved_at=datetime.utcnow()),
-        Enrollment(student_id=students[2].id, course_id=courses[3].id, status='pending'),
+        Enrollment(student_id=students[0].id, course_id=courses[0].id, status='approved', approved_at=now),
+        Enrollment(student_id=students[0].id, course_id=courses[1].id, status='approved', approved_at=now),
+        Enrollment(student_id=students[0].id, course_id=courses[3].id, status='pending'),
+        Enrollment(student_id=students[1].id, course_id=courses[0].id, status='approved', approved_at=now),
+        Enrollment(student_id=students[1].id, course_id=courses[2].id, status='approved', approved_at=now),
+        Enrollment(student_id=students[2].id, course_id=courses[0].id, status='approved', approved_at=now),
+        Enrollment(student_id=students[2].id, course_id=courses[2].id, status='pending'),
     ]
     db.session.add_all(enrollments)
 
@@ -875,37 +924,51 @@ def seed_database():
     assignments = [
         Assignment(course_id=courses[0].id, title='Binary Search Tree Implementation',
                    description='Implement BST with insert, delete, and search operations.',
-                   due_date=datetime(2024, 4, 15, 23, 59), max_marks=100),
+                   due_date=now + timedelta(days=7), max_marks=100),
         Assignment(course_id=courses[1].id, title='ER Diagram Design',
                    description='Design a comprehensive ER diagram for a library management system.',
-                   due_date=datetime(2024, 4, 20, 23, 59), max_marks=50),
-        Assignment(course_id=courses[3].id, title='Linear Regression Project',
-                   description='Implement linear regression from scratch using Python.',
-                   due_date=datetime(2024, 4, 25, 23, 59), max_marks=100),
+                   due_date=now + timedelta(days=10), max_marks=50),
+        Assignment(course_id=courses[2].id, title='Deploy a Web App on PaaS',
+                   description='Deploy any small web app on a free cloud platform and share the URL.',
+                   due_date=now + timedelta(days=14), max_marks=100),
     ]
     db.session.add_all(assignments)
 
     # Create exams
     exams = [
         Exam(course_id=courses[0].id, title='DSA Mid-Term Exam', exam_type='midterm',
-             exam_date=datetime(2024, 4, 10, 9, 0), duration=180, max_marks=100, venue='Hall A'),
+             exam_date=now - timedelta(days=5), duration=180, max_marks=100, venue='Hall A'),
         Exam(course_id=courses[1].id, title='DBMS Final Exam', exam_type='final',
-             exam_date=datetime(2024, 5, 5, 10, 0), duration=180, max_marks=100, venue='Hall B'),
+             exam_date=now + timedelta(days=20), duration=180, max_marks=100, venue='Hall B'),
+        Exam(course_id=courses[2].id, title='Cloud Computing Quiz', exam_type='quiz',
+             exam_date=now + timedelta(days=3), duration=30, max_marks=20, venue='Lab 2'),
     ]
     db.session.add_all(exams)
+    db.session.commit()
 
-    # Create announcement
-    ann = Announcement(title='Welcome to CMS Academic Portal!',
-                       content='Welcome to the Course Management System. All students please check your enrolled courses and upcoming assignments.',
-                       author_id=admin.id, target_role='all')
-    db.session.add(ann)
+    # Sample submission (graded) and published mid-term results
+    db.session.add(Submission(assignment_id=assignments[0].id, student_id=students[2].id,
+                              grade=88, feedback='Good work, handle the delete edge cases.'))
+    for s, marks in [(students[0], 92), (students[1], 74), (students[2], 58)]:
+        db.session.add(Result(exam_id=exams[0].id, student_id=s.id, marks_obtained=marks,
+                              total_marks=100, grade_letter=get_grade_letter(marks), published=True))
+
+    # Create announcements
+    db.session.add_all([
+        Announcement(title='Welcome to CMS Academic Portal!',
+                     content='Welcome to the Course Management System. All students please check your enrolled courses and upcoming assignments.',
+                     author_id=admin.id, target_role='all'),
+        Announcement(title='DSA Mid-Term results published',
+                     content='Mid-term results for Data Structures & Algorithms are now available under Results.',
+                     author_id=admin.id, target_role='student'),
+    ])
 
     db.session.commit()
     print("✅ Database seeded with sample data!")
     print("📧 Login credentials:")
     print("   Admin:   admin@cms.edu / admin123")
     print("   Faculty: faculty@cms.edu / faculty123")
-    print("   Student: student@cms.edu / student123")
+    print("   Student: student@cms.edu / student123  (also kavitha@cms.edu, vignesh@cms.edu)")
 
 with app.app_context():
     db.create_all()

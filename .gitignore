@@ -1,0 +1,13 @@
+# Secrets - never commit
+.env
+
+# Local-only data (cloud uses Supabase)
+*.db
+instance/
+uploads/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
